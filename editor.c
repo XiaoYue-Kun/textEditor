@@ -9,8 +9,6 @@
 #define VERSION "0.0.1"
 #define FORCE_QUIT_TIMES 3
 
-
-
 void abAppend(abuf *ab, const char *s, int len) {
     char *new = realloc(ab->b, ab->len + len);
     if (new == NULL) return;
@@ -137,6 +135,20 @@ int editorRowCxToRx(erow *row, int cx){
         rx++;
     }
     return rx;
+}
+
+int editorRowRxToCx(erow *row, int rx){
+    int cur_rx = 0;
+    int cx;
+
+    for(cx=0; cx<row->size; cx++){
+        if(row->chars[cx] == '\t'){
+            cur_rx += (E.tabsize - 1) - (cur_rx % E.tabsize);
+        }
+        cur_rx++;
+        if(cur_rx > rx) return cx;
+    }
+    return cx;
 }
 
 void editorUpdateRow(erow *row){
@@ -282,6 +294,7 @@ char *editorRowsToString(int *buflen){
     }
     return buf;
 }
+
 void editorOpen(char *filename){
     free(E.filename);
     E.filename = strdup(filename);
@@ -306,8 +319,14 @@ void editorOpen(char *filename){
 }
 
 void editorSave(){
-    if(E.filename == NULL)  return;
-
+    if(E.filename == NULL){
+        E.filename = editorPrompt("Save as: %s", NULL);
+        if(E.filename == NULL){
+            // editorPrompt("Save aborted: no file name inputted", NULL);
+            editorSetStatusMessage("Save aborted");
+            return;
+        }
+    }
     int len;
     char *buf = editorRowsToString(&len);
 
@@ -326,6 +345,177 @@ void editorSave(){
     }
     free(buf);
     editorSetStatusMessage("Can't save! I/O error: %s", strerror(errno));
+}
+
+void editorFindCallback(char *query, int key){
+    static int last_match_row = -1;
+    static int last_match_col = -1;
+    static int direction = 1;
+
+    if(key == '\r' || key == '\x1b'){
+        last_match_row = -1;
+        last_match_col = -1;
+        direction = 1;
+        return;
+    }
+    else if(key == ARROW_RIGHT || key == ARROW_DOWN){
+        direction = 1;
+    }
+    else if(key == ARROW_LEFT || key == ARROW_UP){
+        direction = -1;
+    }
+    else{
+        last_match_row = -1;
+        last_match_col = -1;
+        direction = 1;
+    }
+
+    if(last_match_row == -1)    direction = 1;
+    int current_row = last_match_row == -1 ? 0 : last_match_row;
+    int current_col = last_match_col;
+
+    int i;
+    for (i=0; i<E.numrows; i++){
+        erow *row = &E.row[current_row];
+        char *match = NULL;
+        if (direction == 1){
+            if(current_row == last_match_row && last_match_col >= 0){
+                char *search_start = row->render + last_match_col + strlen(query);
+                match = strstr(search_start, query);
+                if(match){
+                    current_col = match - row->render;
+                }
+                else{
+                    current_row++;
+                    if(current_row >= E.numrows)    current_row = 0;
+                    current_col = -1;
+                    continue;
+                }
+            }
+            else{
+                match = strstr(row->render, query);
+                if(match){
+                    current_col = match - row->render;
+                }
+            }
+        }
+        else{
+            if(current_row == last_match_row && last_match_col >= 0){
+                match = NULL;char *best_match = NULL;
+            int best_col = -1;
+            
+            // Find the rightmost match that's before our current position
+            char *search_pos = row->render;
+            while ((search_pos = strstr(search_pos, query)) != NULL) {
+                int pos = search_pos - row->render;
+                if (pos < last_match_col) {
+                    best_match = search_pos;
+                    best_col = pos;
+                }
+                search_pos++;
+            }
+            
+            if (best_match) {
+                match = best_match;
+                current_col = best_col;
+            } else {
+                // No earlier match in this row, move to previous row
+                current_row--;
+                if (current_row < 0) current_row = E.numrows - 1;
+                current_col = -1;
+                continue;
+            }
+            } else {
+                // Search from end of row backwards
+                match = NULL;
+                char *search_pos = row->render;
+                while ((search_pos = strstr(search_pos, query)) != NULL) {
+                    match = search_pos;
+                    current_col = search_pos - row->render;
+                    search_pos++;
+                }
+            }
+        }
+        
+        if (match) {
+            last_match_row = current_row;
+            last_match_col = current_col;
+            E.cy = current_row;
+            E.cx = editorRowRxToCx(row, current_col);
+            E.rowoff = E.numrows;
+            break;
+        }
+        
+        // Move to next/previous row for next iteration
+        if (direction == 1) {
+            current_row++;
+            if (current_row >= E.numrows) current_row = 0;
+        } else {
+            current_row--;
+            if (current_row < 0) current_row = E.numrows - 1;
+        }
+        current_col = -1;  // Reset column for new row
+        
+        // Prevent infinite loop
+        if (i == E.numrows - 1) break;
+    }
+
+}
+
+void editorFind(){
+    int saved_cx = E.cx;
+    int saved_cy = E.cy;
+    int saved_coloff = E.coloff;
+    int saved_rowoff = E.rowoff;
+
+    char *query = editorPrompt("Search: %s (ESC to cancel, arrow to navigate)", editorFindCallback);
+    if (query)  free(query);
+    else{
+        E.cx = saved_cx;
+        E.cy = saved_cy;
+        E.coloff = saved_coloff;
+        E.rowoff = saved_rowoff;
+    }
+
+}
+
+char *editorPrompt(char *prompt, void (*callback)(char *, int)){
+    size_t bufsize = 128;
+    char *buf = (char *) malloc(bufsize);
+    size_t buflen = 0;
+    buf[0] = '\0';
+    while(1){
+        editorSetStatusMessage(prompt, buf);
+        editorRefreshScreen();
+
+        int c = editorReadKey();
+        if(c == DEL_KEY || c == CTRL_KEY('h') || c == BACKSPACE){
+            if(buflen != 0)
+                buf[--buflen] = '\0';
+        }
+        else if(c == '\x1b'){
+            editorSetStatusMessage("");
+            if(callback)    callback(buf, c);
+            free(buf);
+            return NULL;
+        }
+        else if(c == '\r'){
+            if(buflen != 0){
+                editorSetStatusMessage("");
+                if(callback)    callback(buf, c);
+                return buf;
+            }
+        }
+        else if(!iscntrl(c) && c < 128){
+            if(buflen == bufsize - 1){
+                bufsize *= 2;
+                buf = realloc(buf, bufsize);
+            }
+            buf[buflen++] = c;
+            buf[buflen] = '\0';
+        }
+        if (callback)   callback(buf, c);
+    }
 }
 
 void editorMoveCursor(int key) {
@@ -350,7 +540,7 @@ void editorMoveCursor(int key) {
                     E.endmoving = 1;
                 }
             }
-            else if(row && E.cx == rowlen){
+            else if(row && E.cx == rowlen && E.cy < E.numrows-1){
                 E.cy++;
                 E.cx = 0;
             }
@@ -406,6 +596,9 @@ void editorProcessKeypress(){
             break;
         case CTRL_KEY('s'):
             editorSave();
+            break;
+        case CTRL_KEY('f'):
+            editorFind();
             break;
         case PAGE_UP:
         case PAGE_DOWN:
@@ -574,7 +767,7 @@ int main(int argc, char *argv[]){
     if(argc >= 2){
         editorOpen(argv[1]);
     }
-    editorSetStatusMessage("HELP: CTRL-S to save, Ctrl-Q = quit");
+    editorSetStatusMessage("HELP: CTRL-S to save, Ctrl-Q to quit, Ctrl-F to search");
     while(1){
         editorRefreshScreen();
         editorProcessKeypress();
